@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"fmt"
+	"io"
 	"log"
 	"net"
 	"sync"
@@ -15,6 +17,7 @@ import (
 	"github.com/plgd-dev/go-coap/v3/message/pool"
 	"github.com/plgd-dev/go-coap/v3/mux"
 	coapNet "github.com/plgd-dev/go-coap/v3/net"
+	"github.com/plgd-dev/go-coap/v3/net/blockwise"
 	"github.com/plgd-dev/go-coap/v3/net/responsewriter"
 	"github.com/plgd-dev/go-coap/v3/options"
 	"github.com/plgd-dev/go-coap/v3/options/config"
@@ -678,4 +681,112 @@ func handleA(w mux.ResponseWriter, _ *mux.Message) {
 	if err != nil {
 		log.Printf("cannot set response: %v", err)
 	}
+}
+
+func TestBlockWiseManyChunkcs(t *testing.T) {
+	t.Parallel()
+	if testing.Short() {
+		t.SkipNow()
+	}
+
+	testData := []struct {
+		fileSize  int
+		blockSize blockwise.SZX
+	}{
+		{fileSize: 1e3, blockSize: 0},
+		{fileSize: 1e3, blockSize: 1},
+		{fileSize: 1e3, blockSize: 2},
+		{fileSize: 1e3, blockSize: 3},
+		{fileSize: 1e3, blockSize: 4},
+		{fileSize: 1e3, blockSize: 5},
+		{fileSize: 1e3, blockSize: 6},
+		{fileSize: 1e6, blockSize: 6},
+	}
+	for _, tt := range testData {
+		t.Run(
+			fmt.Sprintf("%d/%d", tt.fileSize, tt.blockSize),
+			testBlockWiseManyChunkcs(tt.fileSize, tt.blockSize),
+		)
+	}
+}
+
+func testBlockWiseManyChunkcs(fileSize int, blockSize blockwise.SZX) func(*testing.T) {
+	return func(t *testing.T) {
+		t.Parallel()
+
+		file := largeVirtualFile{
+			size: fileSize,
+		}
+		handler := func(w mux.ResponseWriter, _ *mux.Message) {
+			err := w.SetResponse(codes.Content, message.TextPlain, &file)
+			assert.NoError(t, err, "set response")
+		}
+
+		server := udp.NewServer(
+			options.WithBlockwise(true, blockSize, time.Second),
+			options.WithMux(mux.HandlerFunc(handler)),
+		)
+
+		serverListener, err := coapNet.NewListenUDP("udp", "")
+		require.NoError(t, err)
+		go server.Serve(serverListener)
+		defer serverListener.Close()
+		t.Logf("test server listening on: %s", serverListener.LocalAddr().String())
+
+		clientConn, err := udp.Dial(serverListener.LocalAddr().String())
+		require.NoError(t, err)
+		defer clientConn.Close()
+		t.Logf("client connecting from: %s", clientConn.LocalAddr().String())
+
+		resp, err := clientConn.Get(context.Background(), "/")
+		require.NoError(t, err, "get large resource")
+		assert.Equal(t, codes.Content, resp.Code(), "response code")
+
+		require.NotNil(t, resp.Body(), "body should not be nil on ok request")
+		_, err = io.Copy(io.Discard, resp.Body())
+		require.NoError(t, err, "read body on ok request")
+	}
+}
+
+// largeVirtualFile is used by tests to simulate a large file.
+// It implements the [io.ReadSeeker] interface.
+type largeVirtualFile struct {
+	size   int
+	offset int
+}
+
+func (f *largeVirtualFile) Read(p []byte) (int, error) {
+	targetSize := f.size - f.offset
+	size := 0
+
+	for size < len(p) && size < targetSize {
+		size++
+	}
+
+	f.size += size
+
+	if size >= f.size {
+		return size, io.EOF
+	}
+
+	return size, nil
+}
+
+func (f largeVirtualFile) Seek(offset int64, whence int) (int64, error) {
+	switch whence {
+	case io.SeekStart:
+		f.offset = int(offset)
+	case io.SeekCurrent:
+		f.offset += int(offset)
+	case io.SeekEnd:
+		f.offset = f.size + whence
+	default:
+		return 0, fmt.Errorf("unexpected whence value: %d", whence)
+	}
+
+	if f.offset < 0 {
+		return 0, fmt.Errorf("illegal offset: %d (%d)", offset, whence)
+	}
+
+	return int64(f.offset), nil
 }
